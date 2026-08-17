@@ -1,0 +1,256 @@
+name: Build linux rootfs
+
+on:
+  workflow_dispatch:
+    inputs:
+      config_url:
+        description: 'Optional URL to a kernel .config file; leave empty to use openstick_defconfig'
+        required: false
+        default: ''
+      runner:
+        description: 'Runner label to use; leave empty to use ubuntu-22.04-arm'
+        required: false
+        default: 'ubuntu-22.04-arm'
+
+jobs:
+  kernel:
+    runs-on: ${{ github.event.inputs.runner }}
+    strategy:
+      fail-fast: false
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+    steps:
+      - name: Configure arm64 sources
+        shell: bash
+        run: |
+          set -eux
+          # Check if the current system is not arm64
+          if [ "$(dpkg --print-architecture)" != "arm64" ]; then
+            sudo dpkg --add-architecture arm64
+            sudo apt-get update
+            sudo apt-get install -y libssl-dev:arm64
+          fi
+
+      - name: Initialization environment
+        shell: bash
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y curl
+          sudo apt-get install -y gcc make git
+          sudo apt-get install -y binfmt-support gcc-aarch64-linux-gnu flex bison libncurses-dev build-essential fakeroot mkbootimg
+          sudo apt-get install -y debhelper-compat bc libelf-dev libssl-dev rsync
+
+      - name: Clean work space
+        shell: bash
+        run: |
+          set -eux
+          PARENT_DIR="${RUNNER_WORKSPACE}"
+          if [ -d "$PARENT_DIR" ]; then
+            find "$PARENT_DIR" -mindepth 1 -maxdepth 1 \
+              -path "$GITHUB_WORKSPACE" -prune -o \
+              -exec rm -rf -- {} +
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Download config
+        if: ${{ github.event.inputs.config_url != '' }}
+        shell: bash
+        run: |
+          set -eux
+          cd "$GITHUB_WORKSPACE"
+          curl -L --fail "$CONFIG_URL" -o .config
+          make olddefconfig
+
+      - name: Kernel config
+        shell: bash
+        run: |
+          set -eux
+          cd "$GITHUB_WORKSPACE"
+          if [ ! -f ".config" ]; then
+            make openstick_defconfig
+          fi
+          ls -l .config
+
+      - name: Build deb kernel
+        env:
+          LOCALVERSION: ${{ vars.LOCAL_VERSION }}
+        shell: bash
+        run: |
+          set -eux
+          cd "$GITHUB_WORKSPACE"
+          JOBS="$(nproc)"
+          echo "Building with ${JOBS} jobs"
+          make -j"${JOBS}" deb-pkg
+
+      - name: Collect build artifacts
+        env:
+          DEVICE_DTB: ${{ vars.DEVICE_DTB }}
+        shell: bash
+        run: |
+          set -eux
+          ARTIFACT_DIR="$RUNNER_TEMP/kernel-artifacts"
+          if [ -d $ARTIFACT_DIR ]; then
+            rm -rf "$ARTIFACT_DIR/*"
+          else
+            mkdir -p "$ARTIFACT_DIR"
+          fi
+
+          find "$RUNNER_WORKSPACE" -maxdepth 1 -type f -name '*.deb' -exec cp -f {} "$ARTIFACT_DIR/" \;
+          find "$GITHUB_WORKSPACE" -type f -path "*/arch/${ARCH}/boot/Image.gz" -exec cp -f {} "$ARTIFACT_DIR/" \;
+          find "$GITHUB_WORKSPACE" -type f -path "*/arch/${ARCH}/boot/dts/*/$DEVICE_DTB" -exec cp -f {} "$ARTIFACT_DIR/" \;
+
+          ls -l "$ARTIFACT_DIR"
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-artifacts-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/kernel-artifacts/*.deb
+            ${{ runner.temp }}/kernel-artifacts/Image.gz
+            ${{ runner.temp }}/kernel-artifacts/*.dtb
+          if-no-files-found: error
+
+  debian_rootfs:
+    needs:
+      - kernel
+    runs-on: ${{ github.event.inputs.runner }}
+    strategy:
+      fail-fast: false
+    env:
+      ARCH: arm64
+    steps:
+      - name: Initialization environment
+        shell: bash
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-binfmt binfmt-support debootstrap
+          sudo apt-get install -y android-sdk-libsparse-utils mkbootimg zerofree
+
+      - name: Clean work space
+        shell: bash
+        run: |
+          set -eux
+          PARENT_DIR="${RUNNER_WORKSPACE}"
+          if [ -d "$PARENT_DIR" ]; then
+            find "$PARENT_DIR" -mindepth 1 -maxdepth 1 \
+              -path "$GITHUB_WORKSPACE" -prune -o \
+              -exec rm -rf -- {} +
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Initialization root image
+        shell: bash
+        run: |
+          set -eux
+          cd "${RUNNER_WORKSPACE}"
+          dd if=/dev/zero bs=100M count=15 of=root.img
+          mkfs.ext4 root.img
+          mkdir debian
+          sudo mount root.img ./debian
+          sudo debootstrap --arch=arm64 --foreign --include=whiptail,apt-listchanges,bash-completion,curl,distro-info-data,initramfs-tools,iso-codes,net-tools,openssh-client,sudo,vim,tcpdump,wireless-regdb,cloud-init,dbus,locales,network-manager,openssh-server,systemd-timesyncd,wget,wireless-tools,busybox,libldap2,libusb-1.0-0,python3-idna,cloud-guest-utils,libmbim-glib4,libwrap0,python3-isoduration,dbus-bin,libmbim-proxy,libwtmpdb0,python3-jinja2,dbus-daemon,libmbim-utils,libx11-6,python3-json-pointer,dbus-session-bus-common,libmm-glib0,libx11-data,python3-jsonpatch,dbus-system-bus-common,libndp0,libxau6,python3-jsonschema,dbus-user-session,libnetfilter-conntrack3,libxcb1,python3-jsonschema-specifications,dns-root-data,libnfnetlink0,libxdmcp6,python3-jwt,dnsmasq-base,libnghttp2-14,libxext6,python3-markupsafe,dracut-install,libnghttp3-9,libxml2,python3-minimal,eatmydata,libngtcp2-16,libxmuu1,python-apt-common,python3-apt,python3-debconf,python3-oauthlib,eject,libngtcp2-crypto-gnutls8,libyaml-0-2,python3-referencing,gdisk,libnl-3-200,linux-base,python3-requests,groff-base,libnl-genl-3-200,lsb-release,python3-rfc3339-validator,initramfs-tools-bin,libnl-route-3-200,media-types,python3-rfc3986-validator,initramfs-tools-core,libnm0,modemmanager,python3-rfc3987,klibc-utils,libp11-kit0,ncurses-term,python3-rpds-py,libatomic1,libpam-systemd,netcat-openbsd,python3-typeshed,libbluetooth3,libpcap0.8t64,network-manager-l10n,python3-uritemplate,libbrotli1,libpcsclite1,openssh-sftp-server,python3-urllib3,libc-l10n,libpolkit-agent-1-0,polkitd,python3-webcolors,libcbor0.10,libpolkit-gobject-1-0,ppp,python3-yaml,libcurl3t64-gnutls,libpsl5t64,publicsuffix,python3.13,libcurl4t64,libpython3-stdlib,python-babel-localedata,python3.13-minimal,libdbus-1-3,libpython3.13-minimal,python3,runit-helper,libduktape207,libpython3.13-stdlib,python3-arrow,sgml-base,libeatmydata1,libqmi-glib5,python3-attr,shared-mime-info,libexpat1,libqmi-proxy,python3-babel,ucf,libffi8,libqmi-utils,python3-bcrypt,usb-modeswitch,libfido2-1,libqrtr-glib0,python3-blinker,usb-modeswitch-data,libglib2.0-0t64,librtmp1,python3-certifi,wpasupplicant,libglib2.0-data,libsasl2-2,python3-cffi-backend,xauth,libgnutls30t64,libsasl2-modules,python3-chardet,xdg-user-dirs,libgudev-1.0-0,libsasl2-modules-db,python3-charset-normalizer,xml-core,libiw30t64,libssh2-1t64,python3-configobj,zstd,libjim0.83,libtasn1-6,python3-cryptography,libklibc,libteamdctl0,python3-dateutil,libldap-common,libuchardet0,python3-fqdn trixie debian https://deb.debian.org/debian
+
+      - name: Second stage
+        shell: bash
+        run: |
+          set -eux
+          cd "${RUNNER_WORKSPACE}"
+          sudo mount -t proc /proc debian/proc
+          sudo mount -t sysfs /sys debian/sys
+          sudo mount --bind /dev debian/dev
+          sudo mount --bind /dev/pts debian/dev/pts
+          sudo chroot ./debian debootstrap/debootstrap --second-stage
+
+      - name: Download kernel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-artifacts-${{ github.run_id }}
+          path: ${{ runner.temp }}/kernel-artifacts
+
+      - name: Install Kernel
+        shell: bash
+        run: |
+          set -eux
+          cd "${RUNNER_WORKSPACE}"
+          if [ -d "${RUNNER_TEMP}/kernel-artifacts" ]; then
+            find "${RUNNER_TEMP}/kernel-artifacts" -maxdepth 1 -type f -exec cp -f {} debian/tmp/ \;
+          else
+            echo "No cached kernel artifacts found in ${RUNNER_TEMP}/kernel-artifacts" >&2
+            exit 1
+          fi
+          sudo chroot ./debian /bin/bash -lc "set -eux; ls -l /tmp; dpkg -i /tmp/*.deb"
+
+      - name: Apply patch
+        shell: bash
+        run: |
+          set -eux
+          cd "${RUNNER_WORKSPACE}"
+          wget -O 'rootfs_patch.tar.gz' "${{ secrets.ROOTFS_PATCH_URL }}"
+          sudo tar -xzf rootfs_patch.tar.gz -C "${RUNNER_WORKSPACE}/debian"
+
+      - name: Make boot image
+        env:
+          DEVICE_DTB: ${{ vars.DEVICE_DTB }}
+          ROOTFS_PARTUUID: ${{ vars.ROOTFS_PARTUUID }}
+        shell: bash
+        run: |
+          set -eux
+          cd "${RUNNER_WORKSPACE}"
+
+          cp ${RUNNER_TEMP}/kernel-artifacts/Image.gz ./
+          cp ${RUNNER_TEMP}/kernel-artifacts/${DEVICE_DTB} ./
+          ls -lh ${RUNNER_WORKSPACE}/debian/boot/
+          cp ${RUNNER_WORKSPACE}/debian/boot/initrd* ./initrd
+          cat Image.gz ${DEVICE_DTB} > kernel-dtb
+          mkbootimg \
+            --base 0x80000000 \
+            --kernel_offset 0x00080000 \
+            --ramdisk_offset 0x02000000 \
+            --tags_offset 0x01e00000 \
+            --pagesize 2048 \
+            --second_offset 0x00f00000 \
+            --ramdisk initrd \
+            --cmdline "root=PARTUUID=$ROOTFS_PARTUUID console=ttyMSM0,115200 no_framebuffer=true rw"\
+            --kernel kernel-dtb -o boot.img
+
+          cp boot.img $RUNNER_TEMP/boot.img
+
+      - name: Clean temp files
+        shell: bash
+        run: |
+          set -eux
+          cd "${RUNNER_WORKSPACE}"
+          sudo rm -rf ./debian/tmp/*
+          sudo chroot ./debian apt clean
+          sudo umount -l debian || true
+          e2fsck -p -f root.img
+          zerofree root.img
+          sudo resize2fs root.img 1000M
+
+      - name: Package rootfs image
+        shell: bash
+        run: |
+          set -eux
+          cd "${RUNNER_WORKSPACE}"
+          img2simg root.img rootfs.img
+          cp rootfs.img $RUNNER_TEMP/rootfs.img
+
+      - name: Upload rootfs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Linux-rootfs-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/boot.img
+            ${{ runner.temp }}/rootfs.img
+          if-no-files-found: error
